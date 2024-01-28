@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 from json import dumps
 from signal import signal, SIGINT
 import traceback
-from multiprocessing import Process, Queue, Lock
+from multiprocessing import Process, Lock, Queue
+from threading import Event
 
 load_dotenv()
 
@@ -27,6 +28,8 @@ def print_slack(req, slack_client, message, blocks = None):
 
 
 def close_port(a=None, b=None):
+    if listen_process.is_alive() :
+        listen_process.terminate()
     udp_client.close_connection()
     exit(0)
 
@@ -50,39 +53,36 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
                 # Acknowledge the request anyway
                 if command == "start":       
                     if not udp_client.is_alive :
-                        try:
-                            print_slack(req, slack_client, "Starting process")
+                        print_slack(req, slack_client, "Starting process")
 
-                            q: Queue = Queue()  
+                        udp_client.open_connection()
 
-                            udp_client.open_connection()
+                        #Create new process
+                        listen_process = Process(
+                            target=udp_client.listen,
+                            args=(
+                                n, #Buffer size, default value to 1500
+                                True, #Verbose
+                                file, #Save to file
+                                q, #Queue
+                            ),
+                        )
+                        listen_process.start()
+                        udp_client.send(f, n, t, dyna, q, lock)
 
-                            listen_process = Process(
-                                target=udp_client.listen,
-                                args=(
-                                    n, #Buffer size, default value to 1500
-                                    True, #Verbose
-                                    "", #Save to file
-                                    q, #Queue
-                                ),
-                            )
+                        #Block until listen process has finished
+                        listen_process.join()
 
-                            listen_process.start()
-                            udp_client.send(f, n, t, True, q, lock)
+                        #Closing when finished :
+                        listen_process.close()
 
-                            #Block until listen process has finished
-                            listen_process.join()
-                            print("Exit code : ")
-                            print(listen_process.exitcode)
+                        #Reset udp_client internal data
+                        udp_client.reset()
 
-                            #Closing when finished :
-                            listen_process.close()
+                        #Flushing Queue
+                        while not q.empty() :
+                            r = q.get(block=False)
 
-                            #Reset udp_client internal data
-                            udp_client.reset()
-
-                        except Exception as e:
-                            print(e)
                     else:
                         print_slack(req, slack_client, "Process already started !")
 
@@ -117,14 +117,14 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
         print(traceback.format_exc())
 
 
-
 n = 1500 #Buffer size in server.
-t = 10 #Client running time, uint is second.
+t = 5 #Client running time, uint is second.
 dyna = True #Whether to use dynamic bandwidth adaption.
 ip = "127.0.0.1"
 rp = 10002
 lp = 10003
 f = 1.0 #frequency
+file = 'result.csv'
 
 # Initialize SocketModeClient with an app-level token + WebClient
 slack_client = SocketModeClient(
@@ -140,8 +140,18 @@ udp_client = udp_rtt.Client(
     local_port=lp,
     slack_client=slack_client,
 )
-
+q :Queue = Queue()
 lock = Lock()
+
+listen_process = Process(
+    target=udp_client.listen,
+    args=(
+        n, #Buffer size, default value to 1500
+        True, #Verbose
+        file, #Save to file
+        q, #Queue
+    ),
+)
 
 # Add a new listener to receive messages from Slack
 # You can add more listeners like this
@@ -152,7 +162,6 @@ slack_client.connect()
 
 signal(SIGINT, close_port)
 
-from threading import Event
 Event().wait()
 
 print("Closing UDP Socket")
