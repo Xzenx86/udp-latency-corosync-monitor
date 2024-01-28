@@ -4,8 +4,9 @@ import math
 import csv
 import sys
 import getopt
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Lock
 from typing import Any, Optional, List, Union
+from os import getpid 
 
 HEADER_SIZE = 32 + 4 + 8
 BUFFER_SIZE = 3_000_000
@@ -18,6 +19,7 @@ class Client:
         local_port: int = 20002,
         remote_ip: str = "127.0.0.1",
         to_port: int = 20001,
+        slack_client = None
     ) -> None:
         self.local_ip = local_ip
         self.local_port = local_port
@@ -26,10 +28,31 @@ class Client:
         self.send_log: List[List[Union[int, float]]] = []
         self.receive_log: List[List[Union[int, float]]] = []
         self.packet_index = 1
+        self.is_alive = False
+        self.slack_client = slack_client
+        self.alert_latency = 0.0
 
+        #self._udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
+        #self._udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
+        #self._udp_socket.bind((self.local_ip, self.local_port))
+
+    def close_connection(self) :
+        self._udp_socket.close()
+        self.is_alive = False
+    
+    def open_connection(self) :
         self._udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self._udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_SIZE)
         self._udp_socket.bind((self.local_ip, self.local_port))
+        self.is_alive = True
+
+    def set_alert(self, latency) :
+        self.alert_latency = latency
+
+    def reset(self):
+        self.send_log = []
+        self.packet_index = 1
+        self.close_connection()
 
     def send(
         self,
@@ -38,6 +61,7 @@ class Client:
         running_time: int,
         dyna: bool,
         q: Queue,
+        lock : Lock,
     ) -> None:
         if packet_size < HEADER_SIZE or packet_size > 1500:
             raise Exception(
@@ -53,17 +77,24 @@ class Client:
         _fill = b"".join([b"\x00"] * (_payload_size))
 
         while True:
+            lock.acquire()
             index_bytes = self.packet_index.to_bytes(4, "big")
             current_time = time.time_ns()
             msg = index_bytes + current_time.to_bytes(8, "big") + _fill
+
+            #print("Sending message with packet index : " + str(self.packet_index))
             send_nums = self._udp_socket.sendto(msg, (self.remote_ip, self.to_port))
+
             self.send_log.append([self.packet_index, current_time, send_nums])
 
             if (
                 current_time - start_time
             ) > running_time or self.packet_index >= total_packets:
+                lock.release()
                 break
+
             self.packet_index += 1
+            lock.release()
 
             if dyna:
                 prac_period = (
@@ -87,16 +118,18 @@ class Client:
                 (0).to_bytes(4, "big"), (self.remote_ip, self.to_port)
             )
             time.sleep(0.05)
-        self._udp_socket.close()
+        #self._udp_socket.close()
 
     def listen(
         self, buffer_size: int, verbose: bool, save: Optional[str], q: Queue
     ) -> None:
         latency = 0.0
+
         while True:
             msg, _ = self._udp_socket.recvfrom(buffer_size)
             recv_time = time.time_ns()
             packet_index = int.from_bytes(msg[:4], "big")
+            #print("receive message with packet index : " + str(packet_index))
             send_time = int.from_bytes(msg[4:12], "big")
 
             old_latency = latency
@@ -109,17 +142,26 @@ class Client:
                 [packet_index, latency, jitter, recv_time, recv_size]
             )
 
-            if verbose:
-                print(
-                    "[  Server: %d  |  Packet: %6d  |  Latency: %f ｜ Jitter: %f |  Data size: %4d  ]"
+            stat =  "[  Server: %d  |  Packet: %6d  |  Latency: %f ｜ Jitter: %f |  Data size: %4d  ]" \
                     % (self.local_port, packet_index, latency, jitter, recv_size)
-                )
+            if verbose:
+                print(stat)
+                if self.slack_client != None:
+                    self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
 
-        self.evaluate()
+            if self.alert_latency != 0.0 and latency >= self.alert_latency:
+                stat = "Alert ! Latency high ! : " + stat
+                self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
+
+        _, stat = self.evaluate()
 
         if save:
             self.save(save)
         q.put(0)
+        print(stat)
+        if self.slack_client != None :
+            self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
+
 
     def evaluate(self):
         latency_list = [row[1] for row in self.receive_log]
@@ -134,23 +176,21 @@ class Client:
             [x[0] for x in self.receive_log]
         )
 
-        print("| -------------  Summary  --------------- |")
-        print(
-            "Total %d packets are received in %f seconds"
-            % (len(self.receive_log), cycle)
-        )
-        print("Average latency: %f second" % latency_avg)
-        print("Maximum latency: %f second" % latency_max)
-        print("Std latency: %f second" % latency_std)
-        print("bandwidth: %f Mbits" % (bandwidth * 8 / 1024 / 1024))
-        print("Jitter (Latency Max - Min): %f second" % jitter)
-        print("Packet loss: %f" % packet_loss)
+        stat = "| -------------  Summary  --------------- |\n"
+        stat += f"Total %d packets are received in %f seconds\n" % (len(self.receive_log), cycle)
+        stat += f"Average latency: %f second\n" % latency_avg
+        stat += f"Maximum latency: %f second\n" % latency_max
+        stat += f"Std latency: %f second\n" % latency_std
+        stat += f"bandwidth: %f Mbits\n" % (bandwidth * 8 / 1024 / 1024)
+        stat += f"Jitter (Latency Max - Min): %f second\n" % jitter
+        stat += f"Packet loss: %f\n" % packet_loss
+
         return {
             "latency_max": latency_max,
             "latency_avg": latency_avg,
             "jitter": jitter,
             "bandwidth": bandwidth,
-        }
+        }, stat
 
     def save(self, path):
         with open(path, "w") as f:
@@ -191,6 +231,7 @@ class Server:
                 break
 
             if verbose:
+                #print("receive message with packet index : " + str(packet_index))
                 print("Receive message at time %d" % recv_time)
 
     def send(self, packet_size, verbose, q):
@@ -212,6 +253,7 @@ class Server:
                 break
 
             if verbose:
+                #print("Send message with packet index : " + str(packet_index))
                 print("Send message at time %d" % current_time)
 
     def __del__(self):
@@ -288,12 +330,15 @@ if __name__ == "__main__":
             local_port=int(opts["--lp"]),
             to_port=int(opts["--rp"]),
         )
-        q = Queue()
 
-        listen_process = Process(
-            target=server.listen, args=(int(opts["-b"]), eval(opts["--verbose"]), q)
-        )
-        listen_process.start()
-        server.send(int(opts["-n"]), eval(opts["--verbose"]), q)
-        listen_process.join()
-        listen_process.close()
+        while True :
+            q = Queue()
+
+            listen_process = Process(
+                target=server.listen, args=(int(opts["-b"]), eval(opts["--verbose"]), q)
+            )
+            listen_process.start()
+            server.send(int(opts["-n"]), eval(opts["--verbose"]), q)
+            listen_process.join()
+            listen_process.close()
+            print("Client has finished, restarting new session ...")

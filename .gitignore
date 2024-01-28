@@ -2,3 +2,10 @@
 *.csv
 .vscode
 .mypy_cache
+venv
+__pycache__
+.env
+markdown_to_slack.py
+README.md.slack
+udp_rtt.original.py
+slack_socket.py
