@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from json import dumps
 from signal import signal, SIGINT
 import traceback
-from multiprocessing import Process, Lock, Queue
+from multiprocessing import Process, Lock, Queue, Manager
 from threading import Event
 
 load_dotenv()
@@ -18,9 +18,10 @@ def print_json(data):
     json_formatted_str = dumps(data, indent=5)
     print(json_formatted_str)
 
-def print_slack(req, slack_client, message, blocks = None):
-    response = SocketModeResponse(envelope_id=req.envelope_id)
-    slack_client.send_socket_mode_response(response)
+def print_slack(req, slack_client, message, ack = True, blocks = None):
+    if ack :
+        response = SocketModeResponse(envelope_id=req.envelope_id)
+        slack_client.send_socket_mode_response(response)
     if blocks == None :
         slack_client.web_client.chat_postMessage(channel=environ.get("SLACK_CHANNEL"), text=message)
     else : 
@@ -28,9 +29,9 @@ def print_slack(req, slack_client, message, blocks = None):
 
 
 def close_port(a=None, b=None):
-    if listen_process.is_alive() :
-        listen_process.terminate()
-    udp_client.close_connection()
+    if udp_client.is_alive :
+        #listen_process.terminate()
+        udp_client.close_connection()
     exit(0)
 
 def print_readme(req, slack_client):
@@ -41,6 +42,10 @@ def print_readme(req, slack_client):
     print_slack(req, slack_client, "Process not running, cannot evaluate", blocks=blocks)
 
 def process(slack_client: SocketModeClient, req: SocketModeRequest):
+    #receive_log_lock.acquire()
+    #print(receive_log)
+    #receive_log_lock.release()
+    global running_time
 
     try :
         if req.payload.get("text") != "" :
@@ -62,19 +67,24 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
                             target=udp_client.listen,
                             args=(
                                 n, #Buffer size, default value to 1500
-                                True, #Verbose
+                                verbose, #Verbose
                                 file, #Save to file
                                 q, #Queue
                             ),
                         )
                         listen_process.start()
-                        udp_client.send(f, n, t, dyna, q, lock)
+                        udp_client.send(f, n, running_time, dyna, q, lock)
 
                         #Block until listen process has finished
                         listen_process.join()
 
                         #Closing when finished :
                         listen_process.close()
+
+                        #Print result
+                        _, stat = udp_client.evaluate()
+                        print_slack(req, slack_client, stat, ack=False)
+                        print(stat)
 
                         #Reset udp_client internal data
                         udp_client.reset()
@@ -91,10 +101,20 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
                         print_slack(req, slack_client, "Stopping process")
                         #Simulate last packet : 
                         lock.acquire()
-                        udp_client.packet_index = int(f * t)
+                        udp_client.packet_index = int(f * running_time)
                         lock.release()
                     else :
                         print_slack(req, slack_client, "Process allready stopped !")
+
+                elif command == "status" :
+                    if len(udp_client.receive_log) != 0 :
+                        _, stat = udp_client.evaluate()
+                        stat += f"Runtime : {running_time} s | Alert : {udp_client.alert_latency} s"
+                        print_slack(req, slack_client, stat)
+                        #slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
+                        #print(stat)
+                    else :
+                        print_slack(req, slack_client, "No speedtest started")
 
                 elif command == "alert": 
                     print("Setting alert")
@@ -107,6 +127,20 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
                     else :
                         print_slack(req, slack_client, "Please provide a latency limit value in ms")
 
+                elif command == 'runtime':
+                    if args != "" :
+                        if args[0].isnumeric() :
+                            if not udp_client.is_alive :
+                                running_time = int(args[0])
+                                print_slack(req, slack_client, "Running time set to : " + str(args[0]) + " s")
+                            else :
+                                print_slack(req, slack_client, "A speedtest is actually running, you cannot modify runtime now.")
+
+                        else :
+                            print_slack(req, slack_client, "Please provide a numeric value")
+                    else :
+                        print_slack(req, slack_client, "Please provide a running time in seconde")
+
                 elif req.payload.get("text") == "help":
                     print_readme(req, slack_client)
         else:
@@ -118,13 +152,14 @@ def process(slack_client: SocketModeClient, req: SocketModeRequest):
 
 
 n = 1500 #Buffer size in server.
-t = 5 #Client running time, uint is second.
+running_time = 60 #Client running time, uint is second.
 dyna = True #Whether to use dynamic bandwidth adaption.
-ip = "127.0.0.1"
+ip = "172.16.1.11"
 rp = 10002
 lp = 10003
 f = 1.0 #frequency
 file = 'result.csv'
+verbose = False
 
 # Initialize SocketModeClient with an app-level token + WebClient
 slack_client = SocketModeClient(
@@ -134,12 +169,17 @@ slack_client = SocketModeClient(
     web_client=WebClient(token=environ.get("SLACK_BOT_TOKEN"))  # xoxb-111-222-xyz
 )
 
+manager = Manager()
+receive_log = manager.list()
+
 udp_client = udp_rtt.Client(
     remote_ip=ip,
     to_port=rp,
     local_port=lp,
     slack_client=slack_client,
+    receive_log=receive_log,
 )
+
 q :Queue = Queue()
 lock = Lock()
 

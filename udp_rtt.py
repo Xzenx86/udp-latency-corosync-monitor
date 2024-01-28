@@ -19,14 +19,15 @@ class Client:
         local_port: int = 20002,
         remote_ip: str = "127.0.0.1",
         to_port: int = 20001,
-        slack_client = None
+        slack_client = None,
+        receive_log = []
     ) -> None:
         self.local_ip = local_ip
         self.local_port = local_port
         self.remote_ip = remote_ip
         self.to_port = to_port
         self.send_log: List[List[Union[int, float]]] = []
-        self.receive_log: List[List[Union[int, float]]] = []
+        self.receive_log = receive_log
         self.packet_index = 1
         self.is_alive = False
         self.slack_client = slack_client
@@ -53,6 +54,8 @@ class Client:
         self.send_log = []
         self.packet_index = 1
         self.close_connection()
+        while len(self.receive_log) != 0 :
+            self.receive_log.pop()
 
     def send(
         self,
@@ -82,7 +85,6 @@ class Client:
             current_time = time.time_ns()
             msg = index_bytes + current_time.to_bytes(8, "big") + _fill
 
-            #print("Sending message with packet index : " + str(self.packet_index))
             send_nums = self._udp_socket.sendto(msg, (self.remote_ip, self.to_port))
 
             self.send_log.append([self.packet_index, current_time, send_nums])
@@ -153,14 +155,14 @@ class Client:
                 stat = "Alert ! Latency high ! : " + stat
                 self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
 
-        _, stat = self.evaluate()
+        #_, stat = self.evaluate()
 
         if save:
             self.save(save)
         q.put(0)
-        print(stat)
-        if self.slack_client != None :
-            self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
+        #print(stat)
+        #if self.slack_client != None :
+        #    self.slack_client.web_client.chat_postMessage(channel='C06FJ6Q2K7X', text=stat)
 
 
     def evaluate(self):
@@ -196,7 +198,11 @@ class Client:
         with open(path, "w") as f:
             writer = csv.writer(f, delimiter=",")
             content = [["index", "latency", "jitter", "recv-time", "recv-size"]]
-            writer.writerows(content + self.receive_log)
+            for i in self.receive_log :
+                content.append(i)
+            #writer.writerows(content + self.receive_log)
+            writer.writerows(content)
+
 
     def __del__(self):
         self._udp_socket.close()
