@@ -7,7 +7,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.socket_mode.request import SocketModeRequest
 from dotenv import load_dotenv
 from json import dumps
-from signal import signal, SIGINT
+from signal import signal, SIGINT, SIGTERM
 import traceback
 from multiprocessing import Process, Lock, Queue, Manager
 from threading import Event
@@ -36,7 +36,7 @@ def close_port(a=None, b=None):
 
 def print_readme(req, slack_client):
     readme = "Cannot open readme file"
-    with open("slack_readme.md", 'r') as file :
+    with open("/home/sso/udp-latency-corosync-monitor/slack_readme.md", 'r') as file :
         readme = file.read()
     blocks = [{"type" : "section", "text" : {"type" : "mrkdwn", "text" : readme}}]
     print_slack(req, slack_client, "Process not running, cannot evaluate", blocks=blocks)
@@ -201,6 +201,7 @@ slack_client.connect()
 # Just not to stop this process    
 
 signal(SIGINT, close_port)
+signal(SIGTERM, close_port)
 
 Event().wait()
 
